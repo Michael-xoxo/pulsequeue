@@ -46,3 +46,27 @@
 - **Socket.io Client Reconnection Callback Staleness & Vite WebSocket Proxy Upgrade (`client/vite.config.js`, `client/src/hooks/usePulseSocket.js`)**:
   - In React, binding Socket.io event listeners inside `useEffect` with changing state callbacks can trigger unnecessary socket disconnects/reconnects on every render, and Vite's dev proxy drops Socket.io WebSocket upgrade frames unless `ws: true` is explicitly enabled on `/socket.io`.
   - Resolved by storing event callbacks in a mutable `useRef` inside `usePulseSocket` so the Socket.io connection lifecycle depends strictly on `token`, and configuring `/socket.io` with `ws: true` and `changeOrigin: true` in `client/vite.config.js`.
+
+## Task 4.5 (Agent Alpha): Production Static Pipeline, Embedded Worker Toggle & Graceful Shutdown
+
+### Architectural Decision Made
+- **Dual-Topology Worker Boot (`EMBED_WORKER=true`) & Express 5 Wildcard SPA Fallback (`server.js`, `workers/batchWorker.js`)**:
+  - Exposed `startWorker()` and `closeWorker()` lifecycle helpers on `workers/batchWorker.js` so PulseQueue can either scale horizontally with dedicated worker containers (`npm run worker`) or run in single-container PaaS topologies (`EMBED_WORKER=true`) while draining active jobs via `await batchWorker.close()` and awaiting in-flight lifecycle telemetry tasks on `SIGTERM` / `SIGINT`.
+  - Registered `express.static(path.join(__dirname, 'client/dist'))` and the Express 5 named splat route `app.get('/{*splat}', ...)` strictly after `/api/auth` and `/api/jobs` so API routes retain strict JWT `authGuard` enforcement while client-side SPA routes resolve `client/dist/index.html`.
+
+### Friction Point / Bug Encountered
+- **Express 5 Path-to-Regexp v8 Wildcard Syntax (`server.js`)**:
+  - Express 5 (`^5.3.0`) upgrades `path-to-regexp`, which rejects bare unnamed `app.get('*', ...)` wildcard routes with a `Missing parameter name` startup error.
+  - Resolved by using the Express 5 named splat syntax `app.get('/{*splat}', ...)` positioned after all `/api/*` routers.
+
+## Task 4.5 (Agent Gamma): Adversarial Concurrency Stress, Tenant Room Isolation & Graceful Drain Verification
+
+### Architectural Decision Made
+- **Concurrent Multi-Tenant Socket Attestation & In-Flight Drain Verification (`tests/adversarial-stress-4.5.test.js`)**:
+  - Designed the adversarial stress suite to dispatch 30 simultaneous `POST /api/jobs/batch` requests via `Promise.all` (15 for Tenant A, 15 for Tenant B) while maintaining two live `socket.io-client` connections and cross-checking every emitted `job:progress` and `job:completed` event ID against the opposing tenant's job ID set to prove zero cross-tenant leakage under load.
+  - Synchronized the graceful shutdown test against the worker's live `progress` emission so `closeWorker()` is deterministically triggered while a 6-item job is mid-flight, verifying that BullMQ drains the active job to `completed` (`100%`) before resolving shutdown.
+
+### Friction Point / Bug Encountered
+- **WHATWG Fetch Restricted SIP Port (`5060`) & Asynchronous Event Fan-Out Drain Synchronization (`tests/adversarial-stress-4.5.test.js`)**:
+  - Binding the test server to port `5060` caused Node's native `undici` `fetch()` to reject requests with `Error: bad port` because `5060` (SIP) is on the WHATWG restricted port blocklist. Additionally, when `batchWorker.close()` resolves after draining an active job, the synchronous `'completed'` event triggers an asynchronous Redis `PUBLISH` (`job:completed`) that must complete before Redis connections close.
+  - Resolved by binding the adversarial stress test server to port `5065` and awaiting `closeWorker()`'s tracked `pendingLifecycleTasks` prior to Redis connection teardown, achieving 30/30 concurrent burst completion in `89.1ms` dispatch latency with `maxObservedActiveCount=5` and zero unhandled rejections.
