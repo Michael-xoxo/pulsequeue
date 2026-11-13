@@ -5,12 +5,14 @@ const cors = require('cors');
 const connectDB = require('./config/db');
 const redisConnection = require('./config/redis');
 const initSocket = require('./socket/socketHandler');
+const queueBridge = require('./socket/queueBridge');
 const authRoutes = require('./routes/authRoutes');
 const batchRoutes = require('./routes/batchRoutes');
 
 const app = express();
 const server = http.createServer(app);
 const io = initSocket(server);
+const bridge = queueBridge(io);
 
 app.set('io', io);
 
@@ -34,6 +36,7 @@ const PORT = process.env.PORT || 5000;
 const startServer = async (port = PORT) => {
   await connectDB();
   const pong = await redisConnection.ping();
+  await bridge.readyPromise;
   console.log(`Redis PING response: ${pong}`);
 
   return new Promise((resolve) => {
@@ -44,11 +47,29 @@ const startServer = async (port = PORT) => {
   });
 };
 
+const closeServer = async () => {
+  await bridge.close();
+  io.close();
+  return new Promise((resolve) => {
+    if (!server.listening) return resolve();
+    server.close(() => resolve());
+  });
+};
+
 if (require.main === module) {
   startServer().catch((err) => {
     console.error('Failed to start server:', err);
     process.exit(1);
   });
+
+  const gracefulShutdown = async () => {
+    await closeServer();
+    await redisConnection.quit();
+    process.exit(0);
+  };
+
+  process.on('SIGINT', gracefulShutdown);
+  process.on('SIGTERM', gracefulShutdown);
 }
 
-module.exports = { app, server, io, startServer };
+module.exports = { app, server, io, bridge, startServer, closeServer };

@@ -65,6 +65,49 @@ const enqueueBatchJob = async (req, res) => {
   }
 };
 
+const listUserJobs = async (req, res) => {
+  try {
+    if (pendingEnqueues.size > 0) {
+      await Promise.allSettled(Array.from(pendingEnqueues.values()));
+    }
+
+    const userId = req.user._id.toString();
+    const jobs = await batchQueue.getJobs(
+      ['waiting', 'active', 'delayed', 'completed', 'failed'],
+      0,
+      100,
+      false
+    );
+
+    const tenantJobs = jobs.filter(
+      (job) => job && job.data && String(job.data.userId) === userId
+    );
+
+    const formatted = await Promise.all(
+      tenantJobs.map(async (job) => ({
+        jobId: job.id,
+        jobType: job.data.jobType || job.name || 'BULK_INVOICE_SYNC',
+        state: await job.getState(),
+        progress: job.progress || 0,
+        attemptsMade: job.attemptsMade,
+        failedReason: job.failedReason || null,
+        result: job.returnvalue || null,
+        data: job.data,
+        timestamp: job.timestamp,
+      }))
+    );
+
+    formatted.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    return res.status(200).json(formatted);
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Failed to list jobs',
+      error: error.message,
+    });
+  }
+};
+
 const getDeadLetterJobs = async (req, res) => {
   try {
     const failedJobs = await FailedJob.find({ userId: req.user._id }).sort({ failedAt: -1 });
@@ -114,6 +157,7 @@ const getJobStatus = async (req, res) => {
 
 module.exports = {
   enqueueBatchJob,
+  listUserJobs,
   getDeadLetterJobs,
   getJobStatus,
 };

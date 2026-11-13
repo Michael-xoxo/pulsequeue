@@ -23,3 +23,15 @@
 - **BullMQ v6 `job.attemptsMade` Pre- vs. Post-Execution Lifecycle (`workers/batchWorker.js`)**:
   - In BullMQ v6, `job.attemptsMade` is incremented inside `moveToCompleted` / `moveToFailed` *after* the processor function returns or throws. Consequently, inside `processorFn(job)`, `job.attemptsMade` is `0` on Attempt 1 and `1` on Attempt 2, whereas inside `worker.on('failed')` it has already been incremented to `1`, `2`, and `3`.
   - Resolved by computing `const currentAttempt = (job.attemptsMade ?? 0) + 1` inside `processorFn` (`currentAttempt < 2`) so transient chaos jobs fail on Attempt 1 and recover on Attempt 2 (`attemptsMade === 2` upon completion), while checking `job.attemptsMade >= maxAttempts` inside `worker.on('failed')` for DLQ quarantine after Attempt 3.
+
+## Task 4.3: Real-Time Event Fan-Out & Tenant-Isolated Socket Broadcasts
+
+### Architectural Decision Made
+- **Dedicated Redis Pub/Sub Event Bridge with Embedded Tenant Context (`socket/queueBridge.js`, `workers/batchWorker.js`)**:
+  - Bridged background worker lifecycle transitions (`job:progress`, `job:completed`, `job:failed`) to Socket.io via a dedicated Redis Pub/Sub channel (`pulsequeue:events`) using an isolated subscriber connection (`redisConnection.duplicate({ maxRetriesPerRequest: null })`).
+  - Embedded `userId` and `jobType` directly into the worker's published Pub/Sub payloads and pipelined `job.updateProgress(percent)` alongside `redisConnection.publish(...)` so `queueBridge` routes events strictly to `io.to(\`tenant:${userId}\`)` (Rule 5) with zero extra Redis/MongoDB lookups on receive and guaranteed sequential delivery (`25% -> 50% -> 75% -> 100% -> completed`).
+
+### Friction Point / Bug Encountered
+- **Redis Subscriber Mode Connection Exclusivity & Event Ordering Across WAN (`socket/queueBridge.js`)**:
+  - Once an `ioredis` connection enters `SUBSCRIBE` mode, it cannot issue standard Redis commands (`PING`, `EVALSHA`, `HGETALL`) without throwing a subscriber-mode error, and using BullMQ `QueueEvents` alone would require a secondary `batchQueue.getJob(jobId)` WAN round-trip per progress tick to resolve `userId`, risking out-of-order arrival between `job:progress(100)` and `job:completed`.
+  - Resolved by isolating a dedicated `subConnection` inside `socket/queueBridge.js` awaited during `startServer()` and publishing pre-enriched tenant payloads directly from `workers/batchWorker.js`.

@@ -3,6 +3,7 @@ const { Worker } = require('bullmq');
 const redisConnection = require('../config/redis');
 const connectDB = require('../config/db');
 const FailedJob = require('../models/FailedJob');
+const { CHANNEL_NAME } = require('../socket/queueBridge');
 
 // Dedicated Redis connection for the blocking BullMQ Worker consumer
 const workerConnection = redisConnection.duplicate({
@@ -15,8 +16,22 @@ workerConnection.on('error', (err) => {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const publishLifecycleEvent = async (userId, event, payload) => {
+  if (!userId) return;
+  await redisConnection.publish(
+    CHANNEL_NAME,
+    JSON.stringify({
+      event,
+      userId: String(userId),
+      payload,
+    })
+  );
+};
+
 const processorFn = async (job) => {
   const {
+    userId,
+    jobType = 'BULK_INVOICE_SYNC',
     itemCount = 1,
     simulateTransientFail = false,
     simulateFatalFail = false,
@@ -41,11 +56,20 @@ const processorFn = async (job) => {
   for (let step = 1; step <= steps; step += 1) {
     await delay(msPerStep);
     const percent = Math.round((step / steps) * 100);
-    await job.updateProgress(percent);
+
+    await Promise.all([
+      job.updateProgress(percent),
+      publishLifecycleEvent(userId, 'job:progress', {
+        jobId: String(job.id),
+        jobType,
+        progress: percent,
+        timestamp: new Date().toISOString(),
+      }),
+    ]);
   }
 
   return {
-    jobId: job.id,
+    jobId: String(job.id),
     processedItems: totalItems,
     status: 'completed',
     completedAt: new Date().toISOString(),
@@ -57,21 +81,39 @@ const batchWorker = new Worker('batch-processor', processorFn, {
   concurrency: 5,
 });
 
+batchWorker.on('completed', async (job, result) => {
+  try {
+    if (!job || !job.data) return;
+    await publishLifecycleEvent(job.data.userId, 'job:completed', {
+      jobId: String(job.id),
+      jobType: job.data.jobType || job.name || 'BULK_INVOICE_SYNC',
+      result,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error(`Failed to publish job:completed event for ${job?.id}:`, err.message);
+  }
+});
+
 batchWorker.on('failed', async (job, err) => {
   try {
     if (!job) return;
     const maxAttempts = (job.opts && job.opts.attempts) || 3;
+    const isDeadLetter = job.attemptsMade >= maxAttempts;
+    const failedReason = (err && err.message) || job.failedReason || 'Unknown worker failure';
+    const jobType = (job.data && job.data.jobType) || job.name || 'BULK_INVOICE_SYNC';
 
-    if (job.attemptsMade >= maxAttempts) {
+    let quarantinedJob = null;
+    if (isDeadLetter) {
       await connectDB();
-      const quarantinedJob = await FailedJob.findOneAndUpdate(
+      quarantinedJob = await FailedJob.findOneAndUpdate(
         { jobId: String(job.id) },
         {
           jobId: String(job.id),
           userId: job.data.userId,
-          jobType: job.data.jobType || job.name || 'BULK_INVOICE_SYNC',
+          jobType,
           payload: job.data,
-          failedReason: (err && err.message) || job.failedReason || 'Unknown worker failure',
+          failedReason,
           stacktrace:
             Array.isArray(job.stacktrace) && job.stacktrace.length > 0
               ? job.stacktrace
@@ -83,11 +125,24 @@ batchWorker.on('failed', async (job, err) => {
         },
         { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
       );
+    }
 
+    if (job.data && job.data.userId) {
+      await publishLifecycleEvent(job.data.userId, 'job:failed', {
+        jobId: String(job.id),
+        jobType,
+        failedReason,
+        attemptsMade: job.attemptsMade,
+        isDeadLetter,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (quarantinedJob) {
       batchWorker.emit('dlq:persisted', quarantinedJob);
     }
   } catch (dlqError) {
-    console.error(`Failed to persist exhausted job ${job?.id} to DLQ:`, dlqError.message);
+    console.error(`Failed to handle failed job ${job?.id}:`, dlqError.message);
   }
 });
 
