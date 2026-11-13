@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "worker": "node workers/batchWorker.js",
+    "test": "node tests/verify-task-4.2.js"
   },
   "keywords": [],
   "author": "",

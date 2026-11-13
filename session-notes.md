@@ -11,3 +11,15 @@
 - **Upstash Redis TLS Protocol Detection & WAN Round-Trip Latency (`config/redis.js`)**:
   - BullMQ requires `maxRetriesPerRequest: null` on the `ioredis` connection instance, and Upstash cloud instances require TLS negotiation (`rediss://` or `tls` socket options) and exhibit ~220ms WAN round-trip latency per command.
   - Resolved by configuring `config/redis.js` with `maxRetriesPerRequest: null` and automatic TLS detection when `rediss://` or an `.upstash.io` host is present in `REDIS_URL`, alongside in-flight promise coordination in `batchController.js`.
+
+## Task 4.2: Asynchronous BullMQ Workers, Exponential Backoff & Dead-Letter Queue
+
+### Architectural Decision Made
+- **Dedicated Worker Redis Connection Duplication & Idempotent MongoDB DLQ Quarantine (`workers/batchWorker.js`, `models/FailedJob.js`, `routes/batchRoutes.js`)**:
+  - Used `redisConnection.duplicate({ maxRetriesPerRequest: null })` for the BullMQ `Worker` consumer so blocking `BZPOPMIN` operations on the worker never contend with non-blocking producer commands on the Express HTTP server.
+  - Persisted permanently exhausted jobs (`job.attemptsMade >= job.opts.attempts`) into the MongoDB `FailedJob` Dead-Letter Queue collection idempotently via `findOneAndUpdate({ jobId }, ..., { upsert: true })` while retaining `removeOnFail: false` in Redis for dual-layer inspectability, and mounted `GET /api/jobs/dlq` prior to `GET /api/jobs/:id` to prevent route parameter shadowing.
+
+### Friction Point / Bug Encountered
+- **BullMQ v6 `job.attemptsMade` Pre- vs. Post-Execution Lifecycle (`workers/batchWorker.js`)**:
+  - In BullMQ v6, `job.attemptsMade` is incremented inside `moveToCompleted` / `moveToFailed` *after* the processor function returns or throws. Consequently, inside `processorFn(job)`, `job.attemptsMade` is `0` on Attempt 1 and `1` on Attempt 2, whereas inside `worker.on('failed')` it has already been incremented to `1`, `2`, and `3`.
+  - Resolved by computing `const currentAttempt = (job.attemptsMade ?? 0) + 1` inside `processorFn` (`currentAttempt < 2`) so transient chaos jobs fail on Attempt 1 and recover on Attempt 2 (`attemptsMade === 2` upon completion), while checking `job.attemptsMade >= maxAttempts` inside `worker.on('failed')` for DLQ quarantine after Attempt 3.

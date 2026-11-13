@@ -1,11 +1,17 @@
 const crypto = require('crypto');
 const batchQueue = require('../queues/batchQueue');
+const FailedJob = require('../models/FailedJob');
 
 const pendingEnqueues = new Map();
 
 const enqueueBatchJob = async (req, res) => {
   try {
-    const { jobType = 'BULK_INVOICE_SYNC', itemCount } = req.body || {};
+    const {
+      jobType = 'BULK_INVOICE_SYNC',
+      itemCount,
+      simulateTransientFail = false,
+      simulateFatalFail = false,
+    } = req.body || {};
 
     if (typeof jobType !== 'string' || !jobType.trim()) {
       return res.status(400).json({
@@ -22,15 +28,15 @@ const enqueueBatchJob = async (req, res) => {
     const userId = req.user._id.toString();
     const customJobId = `batch-${crypto.randomUUID()}`;
 
-    const enqueuePromise = batchQueue.add(
+    const jobData = {
+      userId,
       jobType,
-      {
-        userId,
-        jobType,
-        itemCount,
-      },
-      { jobId: customJobId }
-    );
+      itemCount,
+      simulateTransientFail: Boolean(simulateTransientFail),
+      simulateFatalFail: Boolean(simulateFatalFail),
+    };
+
+    const enqueuePromise = batchQueue.add(jobType, jobData, { jobId: customJobId });
 
     pendingEnqueues.set(customJobId, enqueuePromise);
     enqueuePromise
@@ -59,6 +65,18 @@ const enqueueBatchJob = async (req, res) => {
   }
 };
 
+const getDeadLetterJobs = async (req, res) => {
+  try {
+    const failedJobs = await FailedJob.find({ userId: req.user._id }).sort({ failedAt: -1 });
+    return res.status(200).json(failedJobs);
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Failed to fetch dead-letter queue jobs',
+      error: error.message,
+    });
+  }
+};
+
 const getJobStatus = async (req, res) => {
   try {
     const { id } = req.params;
@@ -82,6 +100,8 @@ const getJobStatus = async (req, res) => {
       jobId: job.id,
       state,
       progress,
+      attemptsMade: job.attemptsMade,
+      failedReason: job.failedReason || null,
       data: job.data,
     });
   } catch (error) {
@@ -94,5 +114,6 @@ const getJobStatus = async (req, res) => {
 
 module.exports = {
   enqueueBatchJob,
+  getDeadLetterJobs,
   getJobStatus,
 };
