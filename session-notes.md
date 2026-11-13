@@ -35,3 +35,14 @@
 - **Redis Subscriber Mode Connection Exclusivity & Event Ordering Across WAN (`socket/queueBridge.js`)**:
   - Once an `ioredis` connection enters `SUBSCRIBE` mode, it cannot issue standard Redis commands (`PING`, `EVALSHA`, `HGETALL`) without throwing a subscriber-mode error, and using BullMQ `QueueEvents` alone would require a secondary `batchQueue.getJob(jobId)` WAN round-trip per progress tick to resolve `userId`, risking out-of-order arrival between `job:progress(100)` and `job:completed`.
   - Resolved by isolating a dedicated `subConnection` inside `socket/queueBridge.js` awaited during `startServer()` and publishing pre-enriched tenant payloads directly from `workers/batchWorker.js`.
+
+## Task 4.4: Decoupled Real-Time Mission Control UI
+
+### Architectural Decision Made
+- **Zero-Polling Event-Driven React State Architecture (`client/src/hooks/usePulseSocket.js`, `client/src/App.jsx`, `client/src/components/DlqInspector.jsx`)**:
+  - Hydrated initial job state once via `GET /api/jobs` on mount/reconnect, inserted newly dispatched jobs optimistically upon receiving HTTP 202 from `POST /api/jobs/batch`, and drove all progress bar transitions (`0% -> 100%`), status pills, and DLQ quarantine refreshes (`refreshSignal` on `isDeadLetter: true`) purely from Socket.io events (`job:progress`, `job:completed`, `job:failed`) with zero `setInterval` polling.
+
+### Friction Point / Bug Encountered
+- **Socket.io Client Reconnection Callback Staleness & Vite WebSocket Proxy Upgrade (`client/vite.config.js`, `client/src/hooks/usePulseSocket.js`)**:
+  - In React, binding Socket.io event listeners inside `useEffect` with changing state callbacks can trigger unnecessary socket disconnects/reconnects on every render, and Vite's dev proxy drops Socket.io WebSocket upgrade frames unless `ws: true` is explicitly enabled on `/socket.io`.
+  - Resolved by storing event callbacks in a mutable `useRef` inside `usePulseSocket` so the Socket.io connection lifecycle depends strictly on `token`, and configuring `/socket.io` with `ws: true` and `changeOrigin: true` in `client/vite.config.js`.
